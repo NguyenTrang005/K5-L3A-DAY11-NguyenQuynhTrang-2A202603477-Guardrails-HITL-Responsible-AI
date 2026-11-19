@@ -8,10 +8,17 @@ Gemini Red Team dùng Google ADK trong agents/*.py — không đi qua file này.
 """
 from __future__ import annotations
 
+import asyncio
+import math
+import sys
+import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+from openai import RateLimitError
+
 from core.config import (
+    PROVIDER_OPENROUTER,
     get_red_model,
     get_red_provider,
     get_blue_model,
@@ -19,6 +26,32 @@ from core.config import (
     blue_client_kwargs,
     red_openai_client_kwargs,
 )
+
+
+def _openrouter_retry_delay(error: RateLimitError, fallback: float) -> float:
+    body = error.body if isinstance(error.body, dict) else {}
+    details = body.get("error", body)
+    metadata = details.get("metadata") if isinstance(details, dict) else None
+    embedded = metadata.get("headers") if isinstance(metadata, dict) else None
+    headers = (
+        {name.lower(): value for name, value in embedded.items()}
+        if isinstance(embedded, dict)
+        else {}
+    )
+    headers.update(error.response.headers)
+
+    for name in ("retry-after", "x-ratelimit-reset"):
+        try:
+            value = float(headers.get(name, ""))
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(value):
+            continue
+        if name == "x-ratelimit-reset":
+            value = value / 1000 - time.time()
+        if value > 0:
+            return max(value, 1.0)
+    return fallback
 
 
 @dataclass
@@ -51,25 +84,44 @@ class OpenAIRunner:
 
         return OpenAI(**(self.client_kwargs or {}))
 
-    async def chat(self, agent: OpenAIAgent, user_message: str) -> str:
+    async def chat(
+        self, agent: OpenAIAgent, user_message: str, *, user_id: str = "student"
+    ) -> str:
         for hook in self.input_hooks:
             blocked = hook(user_message)
             if blocked:
                 return blocked
 
-        block_msg = await self._run_input_plugins(user_message)
+        block_msg = await self._run_input_plugins(user_message, user_id=user_id)
         if block_msg is not None:
             return block_msg
 
         client = self._client()
-        completion = client.chat.completions.create(
-            model=self.model,
-            messages=[
-                {"role": "system", "content": agent.instruction},
-                {"role": "user", "content": user_message},
-            ],
-            temperature=self.temperature,
-        )
+        messages = [
+            {"role": "system", "content": agent.instruction},
+            {"role": "user", "content": user_message},
+        ]
+        for fallback_delay in (10.0, 30.0, None):
+            try:
+                completion = client.chat.completions.create(
+                    model=self.model,
+                    messages=messages,
+                    temperature=self.temperature,
+                )
+            except RateLimitError as error:
+                if self.provider != PROVIDER_OPENROUTER or fallback_delay is None:
+                    raise
+                delay = _openrouter_retry_delay(error, fallback_delay)
+                if delay > 65:
+                    raise
+                print(
+                    f"OpenRouter HTTP 429. Retrying in {delay:.1f}s...",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                await asyncio.sleep(delay)
+            else:
+                break
         text = (completion.choices[0].message.content or "").strip()
 
         for hook in self.output_hooks:
@@ -78,7 +130,9 @@ class OpenAIRunner:
         text = await self._run_output_plugins(text)
         return text
 
-    async def _run_input_plugins(self, user_message: str) -> str | None:
+    async def _run_input_plugins(
+        self, user_message: str, *, user_id: str = "student"
+    ) -> str | None:
         if not self.plugins:
             return None
         try:
@@ -90,7 +144,7 @@ class OpenAIRunner:
             role="user",
             parts=[types.Part.from_text(text=user_message)],
         )
-        ctx = _MockInvocationContext()
+        ctx = _MockInvocationContext(user_id=user_id)
         for plugin in self.plugins:
             cb = getattr(plugin, "on_user_message_callback", None)
             if cb is None:

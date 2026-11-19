@@ -57,6 +57,8 @@ async def part3_assignment_suite():
     print("CHECKPOINT 3: Assignment suite → outputs/*.json")
     print("=" * 60)
 
+    from openai import RateLimitError
+
     from assignment.pipeline import (
         build_production_plugins,
         build_observability,
@@ -71,6 +73,13 @@ async def part3_assignment_suite():
         print("Suite finished.")
         print("Wrote outputs under repo outputs/")
         return result
+    except RateLimitError:
+        raise SystemExit(
+            "CP3 dừng vì OpenRouter giới hạn yêu cầu (HTTP 429). "
+            "Lần chạy này chưa sinh kết quả. "
+            "Kiểm tra hạn mức OpenRouter và chạy lại khi hệ thống cho phép: "
+            "python src/main.py --part 3"
+        ) from None
     except NotImplementedError as e:
         print(
             "Chưa xong Checkpoint 3 (src/assignment/pipeline.py). "
